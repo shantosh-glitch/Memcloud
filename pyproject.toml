@@ -1,0 +1,23 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "memcloud"
+version = "0.1.0"
+description = "MemCloud -- peer-to-peer LAN RAM pooling (Python backend)"
+requires-python = ">=3.9"
+dependencies = [
+    "zeroconf>=0.131.0",
+    "msgpack>=1.0.7",
+]
+
+[project.optional-dependencies]
+dev = ["pytest>=7.4.0", "pytest-asyncio>=0.23.0"]
+
+[project.scripts]
+memnode = "memnode.daemon:main"
+memcli = "memcli.cli:main"
+
+[tool.setuptools]
+packages = ["memnode", "memcli"]
