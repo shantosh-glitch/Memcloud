@@ -1,6 +1,0 @@
-zeroconf>=0.131.0
-msgpack>=1.0.7
-
-[dev]
-pytest>=7.4.0
-pytest-asyncio>=0.23.0

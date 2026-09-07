@@ -1,176 +1,248 @@
-# MemCloud (Python backend)
+# MemCloud — distributed RAM over a LAN
 
-Peer-to-peer LAN RAM pooling: nodes on the same network donate spare RAM to
-each other's `memnode` daemon so a RAM-constrained machine can offload data
-to someone else's idle memory instead of hitting local limits. Nothing ever
-touches disk; a daemon restart drops everything it was holding. It's a
-volatile mesh cache, not a database.
+Use the idle RAM of other laptops on the network as a memory tier that sits
+between local RAM and disk. When an application on Node A runs out of local
+memory budget, its data is placed in **Node B's physical RAM** instead of
+falling straight to disk.
 
-This is a from-scratch Python implementation, built to avoid a set of
-concrete bugs found in an earlier Rust prototype's audit (unbounded
-allocation from an unchecked length prefix, panics on malformed peer
-messages, no tests, no CI, no redundancy). Every one of those has a
-direct fix or an explicit, documented trade-off below.
+Phase 1 (this build): distributed RAM + image cache demo, over mutual TLS.
+Phase 2 (later): failure recovery, real LLM engine integration.
 
-## Layout
+All data-plane traffic is encrypted and authenticated with mutual TLS. See
+**LLM_NOTES.md** for what LLM workloads can and cannot use remote RAM for.
 
-```
-memnode/
-  config.py      size caps, ports, paths -- the numbers that gate every allocation
-  protocol.py    bounded length-prefixed framing + message definitions (JSON local, msgpack peer wire)
-  blocks.py      the actual RAM store: quota, per-block cap, pinned vs cache, eviction
-  security.py    shared-secret HMAC peer authentication (deliberately no encryption -- see below)
-  peers.py       peer connections, handshake, capacity-aware placement, heartbeat/pruning, mesh gossip
-  discovery.py   mDNS advertise + browse via zeroconf, hands off to peers.connect_to()
-  rpc.py         local RPC server (Unix socket + TCP fallback) for the CLI/SDK/dashboard
-  daemon.py      wires it all together, the `memnode` entrypoint
-memcli/
-  cli.py         command-line client -- store, load, peers, connect, stats, streaming
-tests/
-  test_blocks.py, test_protocol.py, test_security.py    unit tests, no network
-  test_peers_integration.py, test_rpc_integration.py    real sockets, two-daemon scenarios
-```
+---
 
-## Setup
+## Requirements
+
+- Python **3.8 or newer**. Nothing else. No `pip install`, no internet.
+- Both laptops on the **same network**, able to reach each other by IP.
+
+Check on both machines:
 
 ```bash
-python3 -m venv .venv && source .venv/bin/activate
-pip install -r requirements.txt
-# or: pip install -e .[dev]
+python3 --version
 ```
 
-Requires Python 3.9+. Unix sockets (the primary local RPC transport) need
-macOS/Linux; on Windows the daemon automatically falls back to TCP-only
-local RPC (`127.0.0.1:7070`) and logs that it did so.
+---
 
-## Running two nodes and demoing a real cross-machine store
+## Quick start — two laptops
 
-On two machines on the same LAN (or two terminals on one machine, using
-different `--peer-port`/`--rpc-port` so they don't collide):
+Copy the `memcloud/` folder to both laptops.
+
+### Step 0: generate the cluster certificate (once)
+
+On **one** laptop:
 
 ```bash
-# machine A
-export MEMCLOUD_SECRET=your-team-secret
-python3 -m memnode.daemon --name alice
-
-# machine B
-export MEMCLOUD_SECRET=your-team-secret
-python3 -m memnode.daemon --name bob
+cd memcloud
+python3 -m memcloud.security --out cluster
 ```
 
-With mDNS enabled (the default), alice and bob find each other automatically
-on the LAN within a couple seconds. Across subnets/VLANs where multicast
-doesn't reach, connect manually instead:
+This writes `cluster.pem` and `cluster.key` and prints a SHA-256 fingerprint.
+**Copy both files to the other laptop.** A node that does not hold this key
+pair cannot join, cannot read blocks, and cannot impersonate a node. The
+fingerprint printed at startup must be identical on both machines.
+
+`cluster.key` is a secret. Do not commit it.
+
+**Laptop B** (the one lending RAM). Run first:
 
 ```bash
-memcli connect 192.168.1.42:8080
+cd memcloud
+python3 -m memcloud.node --name laptop-b --reserve-pct 25 --budget-mb 64
 ```
 
-Then, from alice's machine:
+It prints its LAN address, e.g. `data plane 192.168.1.42:47801`.
+
+**Laptop A** (the one running the app). Use B's address:
 
 ```bash
-memcli peers                          # confirm bob shows up
-memcli store myfile.txt --peer bob    # store directly into bob's RAM
-memcli load <block_id>                # fetches it back over the wire from bob
-memcli stats                          # confirm it's NOT using alice's local RAM
+cd memcloud
+python3 -m memcloud.node --name laptop-a --peer 192.168.1.42:47801 --budget-mb 512
 ```
 
-Kill bob's process mid-demo and `memcli peers` on alice will show him gone
-within one heartbeat interval (~5s) -- pruned automatically, not left stale.
+Open **http://127.0.0.1:5892** on Laptop A. Both nodes should appear within
+a few seconds.
 
-Large files stream in chunks so the sender's memory footprint stays flat
-regardless of source size:
+> `--peer` is the reliable path. UDP broadcast auto-discovery also runs, but
+> many campus and office networks block broadcast, so always pass `--peer`
+> for a demo you cannot afford to have fail.
+
+---
+
+## Running the demo
+
+In the dashboard on Laptop A:
+
+1. **Seed cache** — generates N frames, writes them to a disk cold store, and
+   loads them into MemCloud. Frames fill the local budget first, then overflow
+   into Laptop B's RAM. Watch B's "hosting for peers" figure climb.
+2. **Run reads** — random frame reads. The table shows `LOCAL` / `PEER` /
+   `DISK` per read with measured latency.
+3. **Spill 25% to peers** — moves the least-recently-used local blocks to B.
+   This is the "A's RAM drops, B's RAM rises" moment.
+4. The **frame preview** performs a real read; if that frame lives on B, those
+   pixels crossed the network to render.
+
+Everything is also available over HTTP:
+
+```
+GET  /api/state              full cluster + cache state (dashboard polls this)
+GET  /api/cache              cache report only
+GET  /api/nodes              node list
+GET  /api/events             SSE event stream
+GET  /api/frame/<id>         the frame itself, as image/bmp
+                             (X-MemCloud-Source header says LOCAL/PEER/DISK)
+POST /api/demo/seed?frames=400
+POST /api/demo/reads?count=200
+POST /api/demo/spill?fraction=0.25
+POST /api/demo/reset
+```
+
+---
+
+## Sizing for 32 GB laptops
+
+Default frame is 640x480 24-bit BMP = **921,654 bytes** (~0.88 MB).
+
+| frames | RAM needed | disk needed |
+|---|---|---|
+| 500   | ~440 MB | ~440 MB |
+| 1,000 | ~880 MB | ~880 MB |
+| 4,000 | ~3.5 GB | ~3.5 GB |
+
+To show ~3 GB of remote RAM, seed ~4,000 frames with a local budget of
+512 MB on A and a reserve of 6 GB on B:
 
 ```bash
-memcli stream-store big.log --peer bob
-memcli stream-load <manifest_block_id> restored.log
+# Laptop B
+python3 -m memcloud.node --name laptop-b --reserve-mb 6144 --budget-mb 64
+
+# Laptop A
+python3 -m memcloud.node --name laptop-a --peer <B-ip>:47801 \
+        --budget-mb 512 --reserve-mb 512
 ```
 
-## Security model: authentication without encryption, on purpose
+Generation runs at roughly 5 ms/frame, so 4,000 frames takes ~20 s of CPU
+plus disk write time.
 
-The reference Rust implementation this is based on used a full Noise-XX
-handshake plus ChaCha20-Poly1305 transport encryption. For a same-LAN
-project among a known team, that's disproportionate engineering time for
-the actual threat model -- eavesdropping on your own trusted wifi is
-low-probability, and getting AEAD crypto right is not free.
+---
 
-What's kept instead: **authentication**, not confidentiality. Every `Hello`
-is challenged with an HMAC-SHA256 over a fresh nonce, keyed with a secret
-every legitimate node shares (`MEMCLOUD_SECRET`). A node that doesn't know
-the secret gets a `Deny` and never joins the mesh. This matters because
-mDNS *broadcasts* your service to the whole LAN, not just your team --
-on shared venue wifi, "anyone can see your daemon" and "anyone can use
-your daemon" are different problems, and only the second one is solved by
-skipping encryption but keeping auth.
+## Options
 
-If you need real confidentiality later, `protocol.py`'s `Hello`/`Welcome`
-messages already carry the `nonce` field a Noise-XX handshake would need --
-swap `security.verify_auth` for a real handshake and wrap
-`read_frame`/`write_frame` in an AEAD transport without changing the
-message shapes.
+| flag | default | meaning |
+|---|---|---|
+| `--name` | hostname | node label in the UI |
+| `--peer HOST:PORT` | — | manual peer, repeatable |
+| `--budget-mb` | 3% of RAM | local app cache budget; overflow point |
+| `--reserve-mb` | 20% of RAM | RAM this node offers to peers |
+| `--min-free-mb` | 1024 | never let host available RAM drop below this |
+| `--data-port` | 47801 | TCP data plane |
+| `--api-port` | 5892 | dashboard / HTTP API |
+| `--discovery-port` | 47800 | UDP broadcast |
+| `--cluster` | `default` | must match across nodes |
+| `--frames-dir` | `~/.memcloud/<name>/frames` | disk cold store |
+| `--tls-cert` | `cluster.pem` | shared cluster certificate |
+| `--tls-key` | `cluster.key` | shared cluster private key |
+| `--insecure` | off | disable TLS. Debugging only. |
+| `--chunk-mb` | 8 | chunk size for large objects / tensors |
 
-**Set `MEMCLOUD_SECRET` to something real before using this beyond local
-testing** -- the code falls back to a well-known demo value so a fresh
-checkout still boots, and loudly warns in the logs when it's using it.
+---
 
-## What's deliberately simple (and the fast follow-ups if you have time)
+## Architecture
 
-- **No replication.** A block lives on exactly one node. If that node's
-  daemon dies, the block is gone. `peers.py` already tracks `remote_blocks`
-  (which peer holds which block we placed), so a primary+backup write
-  (`store_on_peer` to two peers, read tries the first then the second) is
-  a bounded, demoable addition on top of what's here.
-- **Capacity-aware placement exists but is heartbeat-fresh, not live.**
-  `pick_best_peer()` picks the peer that last reported the most free
-  quota, refreshed every `HEARTBEAT_INTERVAL_SECONDS` (5s default) via
-  Ping/Pong. Fine for a demo; a tighter interval or piggybacking quota on
-  every message would make it more responsive.
-- **mDNS is LAN-only**, by construction of multicast -- doesn't cross
-  subnets/VLANs or work in most container/cloud setups. `memcli connect`
-  is the documented manual fallback, not a hidden gap.
-- **No leader/coordination layer.** Keys are owned by whichever node's
-  `SetKey` call reaches a peer first; there's no conflict resolution if
-  two nodes race to claim the same key. Fine for a hackathon demo, worth
-  a paragraph in your slides if judges ask about consistency.
+```
+              APPLICATION  (image cache)
+                    |
+              MemCloud client  ── local budget full? ──┐
+                    |                                   |
+              local RAM dict                     Placement scheduler
+              (this process)                            |
+                                                  pick peer by
+                                                  free reserve − RTT
+                                                        |
+                                                  TCP data plane
+                                                        |
+                                                  Peer worker
+                                                  self._blocks[key] = bytes
+                                                  (peer's physical RAM)
+                    |
+              miss on both ──> disk cold store
+```
 
-## What's already handled (the bugs this was built to avoid)
+| module | layer | role |
+|---|---|---|
+| `discovery.py` | 1 | UDP beacons + manual peers, RAM monitoring via STAT probes |
+| `client.py` | 2, 4 | placement scheduler, remote put/get, LRU spill |
+| `worker.py` | 3 | holds peer blocks in this process's heap, admission control |
+| `protocol.py` | — | length-prefixed frames over TLS, range reads, MGET, connection reuse |
+| `imagecache.py` | 7 | LOCAL → PEER → DISK tiered read path, CRC32 verification |
+| `security.py` | — | cluster cert generation, mutual-TLS contexts |
+| `llm.py` | 8 | tensor store, prefix KV cache over chunked objects |
+| `api.py` + `dashboard.py` | — | HTTP API, SSE, dashboard |
+| `node.py` | — | wires it together |
 
-- **Bounded allocation everywhere.** Every length-prefixed read checks the
-  declared size against `MAX_FRAME_SIZE`/`MAX_BLOCK_SIZE` *before*
-  allocating or reading the body (`protocol.read_frame`,
-  `tests/test_protocol.py::test_read_frame_rejects_oversized_length_without_reading_body`).
-- **No panics on malformed/hostile input.** Every peer-message handler and
-  every RPC handler is wrapped so a bad message logs and continues instead
-  of killing the connection or the daemon
-  (`tests/test_rpc_integration.py::test_malformed_json_does_not_kill_the_server`,
-  `::test_oversized_frame_is_rejected_gracefully_not_a_crash`).
-- **Stale peers get pruned.** A heartbeat loop drops any peer that's gone
-  quiet past `PEER_TIMEOUT_SECONDS`, and a broken connection is removed
-  immediately rather than lingering in the peer list.
-- **Real tests, not just unit tests.** 43 tests total, including
-  integration tests that spin up two real daemons on real TCP sockets and
-  verify a block placed via one daemon's RPC actually lands in the other
-  daemon's memory and can be read back over the wire.
+---
 
-## Running the tests
+## What is actually proven, and what is not
+
+Verified by `tests/test_e2e.py` (43 assertions, all passing):
+
+- A block that exceeds the local budget is sent to a peer, and the peer's
+  in-process byte count grows by exactly that amount.
+- The block reads back with an identical CRC32 — the bytes on the wire are
+  the bytes that were stored.
+- Every cached frame is CRC-verified on every read; zero failures.
+- LRU spill moves blocks off A and onto B, and spilled frames stay readable.
+- Deleting a block makes the next read fall through to the disk tier.
+- The data plane negotiates TLS 1.3 with AES-256-GCM, and both nodes present
+  the same cluster certificate.
+- A plaintext client is rejected. A TLS client *without* the cluster
+  certificate is also rejected (`PEER_DID_NOT_RETURN_A_CERTIFICATE`).
+- A 60 MB object stripes into 8 chunks across both nodes and reassembles
+  byte-exact; a range read across a chunk boundary is exact.
+- A prefix KV cache round-trips identically; a prefix differing by one token
+  is a clean miss.
+
+Run it yourself:
 
 ```bash
-pip install -r requirements.txt
-pytest -v
+python3 tests/test_e2e.py
 ```
 
-43 tests, ~1.5s, no network access required (everything binds to
-127.0.0.1 on ephemeral high ports chosen per test file to avoid clashes).
+**Not yet implemented.** Say so if asked:
 
-## CLI reference
+- **No failure recovery.** Kill Node B and every block it held is gone;
+  reads fall through to the disk cold store only because this demo happens to
+  keep one. There is no replication and no rebuild. That is Phase 2.
+- **One shared key for the whole cluster.** TLS authenticates *membership*,
+  not individual identity — any member could impersonate any other member.
+  Per-node certificates signed by a cluster CA would fix this and is a
+  contained change, but is not done. There is also no revocation.
+- **No real LLM engine integration.** `llm.py` is the storage side only. It
+  has never been wired into llama.cpp, vLLM, or Ollama. See LLM_NOTES.md.
+- **No VRAM pooling.** Nothing here makes two GPUs act as one.
+- **Disk-tier latency is optimistic.** The cold store was just written, so it
+  is warm in the OS page cache. Real cold-disk reads are slower than what the
+  DISK row shows. Do not quote the disk number as a worst case.
+- **Local reads are dict lookups**, so they measure near 0 ms. That is real,
+  but it is a pointer dereference, not a memory-copy benchmark.
 
-| Command | What it does |
-|---|---|
-| `memcli store <file\|-> [--mode pinned\|cache] [--peer NAME \| --auto]` | Store a file's contents as a block |
-| `memcli load <block_id> [--out file]` | Load a block, locally or over the wire |
-| `memcli free <block_id>` | Free a block |
-| `memcli peers` | List connected peers and their last-known free quota |
-| `memcli connect <host:port>` | Manually connect to a peer (mDNS's cross-subnet fallback) |
-| `memcli stats` | This node's quota/usage/peer count |
-| `memcli stream-store <file> [--peer NAME]` | Chunked upload for large files |
-| `memcli stream-load <manifest_id> <out>` | Reassemble a file stored with `stream-store` |
+### TLS cost, measured
+
+On a 1-vCPU container over loopback, single run, high variance:
+
+| | 64 MB write | 64 MB read |
+|---|---|---|
+| mutual TLS 1.3 (AES-256-GCM) | ~389 MB/s | ~249 MB/s |
+| plaintext (`--insecure`) | ~621 MB/s | ~190 MB/s |
+
+Write was roughly 37% slower under TLS. Read came out *faster* under TLS,
+which is measurement noise on one core, not a real result — treat the read row
+as inconclusive.
+
+The point that survives the noise: **both figures are well above gigabit LAN
+throughput (~110 MB/s)**, so on a real two-laptop network the link is the
+bottleneck, not the crypto. The TLS handshake is paid once per peer because
+connections are pooled and reused, not once per block.

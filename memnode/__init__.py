@@ -1,1 +1,0 @@
-"""MemCloud daemon package."""

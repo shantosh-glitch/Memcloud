@@ -1,3 +1,0 @@
-[console_scripts]
-memcli = memcli.cli:main
-memnode = memnode.daemon:main
